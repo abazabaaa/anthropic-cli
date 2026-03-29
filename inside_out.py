@@ -47,7 +47,27 @@ TOOL_MEMORY = {"type": "memory_20250818", "name": "memory"}
 TOOL_WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
 TOOL_WEB_FETCH = {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 5}
 
-ALL_TOOLS = [TOOL_BASH, TOOL_EDITOR, TOOL_MEMORY, TOOL_WEB_SEARCH, TOOL_WEB_FETCH]
+# Custom tool (we define the schema, Claude calls it)
+TOOL_SPAWN_AGENT = {
+    "name": "spawn_agent",
+    "description": "Spawn a sub-agent (another Claude instance) to handle a focused task. The sub-agent has the same tools (bash, editor, web search, memory) and returns its final text response. Use for: research tasks, parallel subtasks, or delegating work you want isolated from your main context. The sub-agent shares the same memory directory.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "A clear, self-contained description of what the sub-agent should do",
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional model override for the sub-agent (default: same as parent)",
+            },
+        },
+        "required": ["task"],
+    },
+}
+
+ALL_TOOLS = [TOOL_BASH, TOOL_EDITOR, TOOL_MEMORY, TOOL_WEB_SEARCH, TOOL_WEB_FETCH, TOOL_SPAWN_AGENT]
 
 # ─── Colors ─────────────────────────────────────────────────────────
 
@@ -268,9 +288,50 @@ def exec_memory(input_data):
     else:
         return f"Error: Unknown memory command: {command}"
 
-# ─── Tool Router ─────────────────────────────────────────────────────
+# ─── Spawn Agent Executor ────────────────────────────────────────────
 
-CLIENT_TOOLS = {"bash", "str_replace_based_edit_tool", "memory"}
+AGENT_DEPTH = int(os.environ.get("INSIDE_OUT_DEPTH", "0"))
+MAX_AGENT_DEPTH = 3
+
+def exec_spawn_agent(input_data):
+    task = input_data["task"]
+    agent_model = input_data.get("model", MODEL)
+    depth = AGENT_DEPTH + 1
+
+    if depth > MAX_AGENT_DEPTH:
+        return f"Error: Maximum agent depth ({MAX_AGENT_DEPTH}) exceeded. Cannot spawn deeper."
+
+    print(f"  {DIM}spawning sub-agent (depth {depth}, model {agent_model})...{RESET}")
+    print(f"  {DIM}task: {task[:100]}{'...' if len(task) > 100 else ''}{RESET}")
+
+    try:
+        r = subprocess.run(
+            ["python3", os.path.abspath(__file__)],
+            input=task + "\n",
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ, "INSIDE_OUT_MODEL": agent_model, "INSIDE_OUT_DEPTH": str(depth)},
+        )
+        # Extract just the text output, strip ANSI codes and prompts
+        import re
+        output = re.sub(r'\x1b\[[0-9;]*m', '', r.stdout)
+        # Remove the banner and prompt lines
+        lines = output.split("\n")
+        result_lines = []
+        in_content = False
+        for line in lines:
+            if line.strip().startswith("you>"):
+                in_content = True
+                continue
+            if in_content and line.strip() not in ("Bye!", ""):
+                result_lines.append(line)
+        result = "\n".join(result_lines).strip()
+        if r.returncode != 0 and r.stderr:
+            result += f"\n[agent stderr: {r.stderr[:500]}]"
+        return result or "(sub-agent produced no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Sub-agent timed out after 300 seconds"
+
+# ─── Tool Router ─────────────────────────────────────────────────────
 
 def execute_tool(name, input_data):
     if name == "bash":
@@ -279,6 +340,8 @@ def execute_tool(name, input_data):
         return exec_editor(input_data)
     elif name == "memory":
         return exec_memory(input_data)
+    elif name == "spawn_agent":
+        return exec_spawn_agent(input_data)
     else:
         return f"Unknown tool: {name}"
 
