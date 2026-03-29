@@ -11,7 +11,7 @@ import readline  # enables arrow keys / history in input()
 from pathlib import Path
 
 MODEL = os.environ.get("INSIDE_OUT_MODEL", "claude-sonnet-4-5-20250929")
-MAX_TOKENS = 8192
+MAX_TOKENS = 16384
 ANT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ant")
 MAX_ROUNDS = 20
 MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".memories")
@@ -79,6 +79,22 @@ RED = "\033[91m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
+
+# ─── Token Usage Tracking ──────────────────────────────────────────
+
+session_usage = {"input": 0, "output": 0}
+
+def print_usage(turn_usage):
+    ti = turn_usage.get("input_tokens", 0)
+    to = turn_usage.get("output_tokens", 0)
+    ci = turn_usage.get("cache_creation_input_tokens", 0)
+    cr = turn_usage.get("cache_read_input_tokens", 0)
+    session_usage["input"] += ti
+    session_usage["output"] += to
+    cache_str = ""
+    if ci or cr:
+        cache_str = f" cache: +{ci:,} / read {cr:,}"
+    print(f"  {DIM}tokens: {ti:,} in / {to:,} out (turn) | {session_usage['input']:,} in / {session_usage['output']:,} out (session){cache_str}{RESET}")
 
 # ─── Bash Tool Executor ─────────────────────────────────────────────
 
@@ -347,46 +363,199 @@ def execute_tool(name, input_data):
 
 # ─── Ant CLI Interface ──────────────────────────────────────────────
 
-def call_ant(messages):
+def build_ant_cmd(messages, tool_choice=None):
+    """Build the base ant command with all flags."""
     cmd = [
-        ANT, "--format", "json",
+        ANT,
         "beta:messages", "create",
         "--model", MODEL,
         "--max-tokens", str(MAX_TOKENS),
         "--system", json.dumps(SYSTEM_PROMPT),
+        # Extended thinking (adaptive)
+        "--thinking", json.dumps({"type": "adaptive"}),
+        # Context management (compaction + clear tool uses + clear thinking)
+        "--beta", "compact-2026-01-12",
+        "--beta", "context-management-2025-06-27",
+        "--context-management", json.dumps({
+            "edits": [
+                {"type": "compact_20260112"},
+                {"type": "clear_tool_uses_20250919"},
+                {"type": "clear_thinking_20251015"},
+            ]
+        }),
     ]
     for tool in ALL_TOOLS:
         cmd += ["--tool", json.dumps(tool)]
+    if tool_choice:
+        cmd += ["--tool-choice", json.dumps(tool_choice)]
     for msg in messages:
         cmd += ["--message", json.dumps(msg)]
+    return cmd
 
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+def call_ant(messages, tool_choice=None):
+    """Non-streaming call (used by spawn_agent subprocess)."""
+    cmd = build_ant_cmd(messages, tool_choice)
+    cmd.insert(1, "--format")
+    cmd.insert(2, "json")
+
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f"ant failed: {r.stderr}")
     return json.loads(r.stdout)
 
+
+def call_ant_stream(messages, tool_choice=None):
+    """Streaming call — yields parsed JSONL events, prints text deltas live."""
+    cmd = build_ant_cmd(messages, tool_choice)
+    cmd.insert(1, "--stream")
+    cmd.insert(2, "--format")
+    cmd.insert(3, "jsonl")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            yield event
+    finally:
+        proc.stdout.close()
+        stderr = proc.stderr.read()
+        proc.stderr.close()
+        ret = proc.wait()
+        if ret != 0 and stderr:
+            raise RuntimeError(f"ant stream failed (exit {ret}): {stderr[:500]}")
+
+# ─── Stream Event Accumulator ───────────────────────────────────────
+
+def consume_stream(messages, tool_choice=None):
+    """Consume a streaming response, printing text live, and return
+    (content_blocks, stop_reason, usage) like call_ant() would."""
+    blocks = []        # accumulated content blocks
+    current_block = {} # block being built
+    stop_reason = None
+    usage = {}
+    printed_thinking = False
+
+    for event in call_ant_stream(messages, tool_choice):
+        etype = event.get("type", "")
+
+        if etype == "message_start":
+            msg = event.get("message", {})
+            usage = msg.get("usage", {})
+
+        elif etype == "content_block_start":
+            current_block = event.get("content_block", {})
+            # Initialize accumulator for tool input JSON
+            if current_block.get("type") == "tool_use":
+                current_block["_input_json"] = ""
+            elif current_block.get("type") == "thinking":
+                if not printed_thinking:
+                    print(f"  {DIM}[thinking...]{RESET}", end="", flush=True)
+                    printed_thinking = True
+
+        elif etype == "content_block_delta":
+            delta = event.get("delta", {})
+            dtype = delta.get("type", "")
+
+            if dtype == "text_delta":
+                text = delta.get("text", "")
+                # Print text as it arrives
+                print(f"{BOLD}{text}{RESET}", end="", flush=True)
+
+            elif dtype == "input_json_delta":
+                # Accumulate tool input JSON
+                current_block["_input_json"] = current_block.get("_input_json", "") + delta.get("partial_json", "")
+
+            elif dtype == "thinking_delta":
+                pass  # We show [thinking...] but don't dump full text
+
+        elif etype == "content_block_stop":
+            if current_block.get("type") == "text":
+                # Ensure newline after streamed text
+                text = current_block.get("text", "")
+                if text:
+                    print()  # newline after streamed text block
+                blocks.append(current_block)
+
+            elif current_block.get("type") == "tool_use":
+                # Parse accumulated JSON
+                raw = current_block.pop("_input_json", "{}")
+                try:
+                    current_block["input"] = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    current_block["input"] = {"_raw": raw}
+                blocks.append(current_block)
+
+            elif current_block.get("type") == "thinking":
+                if printed_thinking:
+                    print()  # newline after [thinking...]
+                    printed_thinking = False
+                blocks.append(current_block)
+
+            elif current_block.get("type") in ("server_tool_use", "web_search_tool_result", "web_fetch_tool_result"):
+                blocks.append(current_block)
+
+            else:
+                # Catch-all for other block types (compaction, etc)
+                blocks.append(current_block)
+
+            current_block = {}
+
+        elif etype == "message_delta":
+            delta = event.get("delta", {})
+            if "stop_reason" in delta:
+                stop_reason = delta["stop_reason"]
+            # Merge usage from message_delta
+            msg_usage = event.get("usage", {})
+            if msg_usage:
+                usage.update(msg_usage)
+
+        elif etype == "message_stop":
+            pass  # Stream complete
+
+    return blocks, stop_reason, usage
+
 # ─── Main Loop ───────────────────────────────────────────────────────
 
-def process_turn(messages):
+def process_turn(messages, is_first_turn=False):
     """Run one full turn: call Claude, execute tools, loop until end_turn."""
     for round_num in range(1, MAX_ROUNDS + 1):
+        # Force memory tool on first message of conversation
+        tool_choice = None
+        if is_first_turn and round_num == 1 and len(messages) == 1:
+            tool_choice = {"type": "tool", "name": "memory"}
+
         try:
-            response = call_ant(messages)
+            content, stop_reason, usage = consume_stream(messages, tool_choice)
         except Exception as e:
             print(f"\n{RED}Error: {e}{RESET}")
             return
 
-        content = response.get("content", [])
-        stop_reason = response.get("stop_reason")
+        # Print token usage
+        if usage:
+            print_usage(usage)
 
+        # Process blocks for tool execution
         tool_results = []
         for block in content:
             btype = block.get("type", "")
 
-            if btype == "text" and block.get("text", "").strip():
-                print(f"\n{BOLD}{block['text']}{RESET}")
+            # Text was already printed during streaming — skip here
 
-            elif btype == "tool_use":
+            if btype == "tool_use":
                 # Client-side tool — we execute it
                 tool_name = block["name"]
                 tool_input = block["input"]
@@ -424,6 +593,12 @@ def process_turn(messages):
                         url = rc.get("url", "")
                         print(f"  {DIM}fetched: {url}{RESET}")
 
+        # Handle compaction — continue the loop
+        if stop_reason == "compaction":
+            print(f"  {DIM}[context compacted]{RESET}")
+            messages.append({"role": "assistant", "content": content})
+            continue
+
         # If stop reason is end_turn or pause_turn with no client tools needed, we're done
         if stop_reason == "end_turn" or (stop_reason == "pause_turn" and not tool_results):
             # For pause_turn, add assistant content and continue to get server results
@@ -450,15 +625,17 @@ def main():
 
     print(f"""{BOLD}
  ╔═══════════════════════════════════════════╗
- ║   Inside-Out Claude Code  v2             ║
- ║   Native API tools + persistent memory   ║
+ ║   Inside-Out Claude Code  v3             ║
+ ║   Streaming + Thinking + Compaction      ║
  ╚═══════════════════════════════════════════╝{RESET}
  Model: {MODEL}
- Tools: bash, text_editor, memory, web_search, web_fetch
+ Tools: bash, text_editor, memory, web_search, web_fetch, spawn_agent
+ Features: streaming, adaptive thinking, context compaction, token tracking
  Commands: quit, clear, model <name>
 """)
 
     messages = []
+    is_first_turn = True
 
     while True:
         try:
@@ -474,7 +651,10 @@ def main():
             break
         if user_input.lower() == "clear":
             messages = []
-            print(f"{DIM}(conversation cleared, memory preserved){RESET}")
+            is_first_turn = True
+            session_usage["input"] = 0
+            session_usage["output"] = 0
+            print(f"{DIM}(conversation cleared, memory preserved, token counts reset){RESET}")
             continue
         if user_input.lower().startswith("model "):
             MODEL = user_input.split(None, 1)[1]
@@ -482,7 +662,8 @@ def main():
             continue
 
         messages.append({"role": "user", "content": user_input})
-        process_turn(messages)
+        process_turn(messages, is_first_turn=is_first_turn)
+        is_first_turn = False
 
 
 if __name__ == "__main__":
