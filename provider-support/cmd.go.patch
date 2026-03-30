@@ -1,0 +1,37 @@
+diff --git a/pkg/cmd/cmd.go b/pkg/cmd/cmd.go
+index 073c9d9..073aa96 100644
+--- a/pkg/cmd/cmd.go
++++ b/pkg/cmd/cmd.go
+@@ -78,7 +78,32 @@ func init() {
+ 				Name:    "auth-token",
+ 				Sources: cli.EnvVars("ANTHROPIC_AUTH_TOKEN"),
+ 			},
++			&cli.StringFlag{
++				Name:  "provider",
++				Usage: "API provider: anthropic (default), vertex, or bedrock",
++				Sources: cli.EnvVars("ANTHROPIC_PROVIDER"),
++				Value: "anthropic",
++				Validator: func(p string) error {
++					switch p {
++					case "anthropic", "vertex", "bedrock":
++						return nil
++					default:
++						return fmt.Errorf("provider must be one of: anthropic, vertex, bedrock")
++					}
++				},
++			},
++			&cli.StringFlag{
++				Name:    "region",
++				Usage:   "Cloud region for Vertex AI or Bedrock (e.g. us-central1, us-east-1)",
++				Sources: cli.EnvVars("CLOUD_REGION"),
++			},
++			&cli.StringFlag{
++				Name:    "project-id",
++				Usage:   "Google Cloud project ID (required for Vertex AI)",
++				Sources: cli.EnvVars("GOOGLE_CLOUD_PROJECT"),
++			},
+ 		},
++		Before: initProvider,
+ 		Commands: []*cli.Command{
+ 			{
+ 				Name:     "completions",

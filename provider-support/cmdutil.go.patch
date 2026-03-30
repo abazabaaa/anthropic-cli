@@ -1,0 +1,124 @@
+diff --git a/pkg/cmd/cmdutil.go b/pkg/cmd/cmdutil.go
+index b985d11..4fe9ce3 100644
+--- a/pkg/cmd/cmdutil.go
++++ b/pkg/cmd/cmdutil.go
+@@ -2,6 +2,7 @@ package cmd
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+@@ -17,7 +18,9 @@ import (
+ 	"syscall"
+ 
+ 	"github.com/anthropics/anthropic-cli/internal/jsonview"
++	"github.com/anthropics/anthropic-sdk-go/bedrock"
+ 	"github.com/anthropics/anthropic-sdk-go/option"
++	"github.com/aws/aws-sdk-go-v2/config"
+ 
+ 	"github.com/charmbracelet/x/term"
+ 	"github.com/itchyny/json2yaml"
+@@ -29,6 +32,72 @@ import (
+ 
+ var OutputFormats = []string{"auto", "explore", "json", "jsonl", "pretty", "raw", "yaml"}
+ 
++// providerOptions holds request options resolved during the Before hook for
++// Vertex AI or Bedrock providers. Empty for the default Anthropic provider.
++var providerOptions []option.RequestOption
++
++// initProvider is the Before hook on the root command. It resolves provider-specific
++// request options once, before any subcommand handler runs.
++func initProvider(ctx context.Context, cmd *cli.Command) (context.Context, error) {
++	provider := cmd.String("provider")
++	region := cmd.String("region")
++
++	switch provider {
++	case "", "anthropic":
++		return ctx, nil
++
++	case "vertex":
++		projectID := cmd.String("project-id")
++		if region == "" {
++			region = os.Getenv("GOOGLE_CLOUD_REGION")
++		}
++		if region == "" {
++			return ctx, fmt.Errorf("--region is required for vertex provider (or set GOOGLE_CLOUD_REGION)")
++		}
++		if projectID == "" {
++			return ctx, fmt.Errorf("--project-id is required for vertex provider (or set GOOGLE_CLOUD_PROJECT)")
++		}
++		opt, err := initVertexProvider(region, projectID)
++		if err != nil {
++			return ctx, err
++		}
++		providerOptions = []option.RequestOption{opt}
++		return ctx, nil
++
++	case "bedrock":
++		if region == "" {
++			region = os.Getenv("AWS_REGION")
++			if region == "" {
++				region = os.Getenv("AWS_DEFAULT_REGION")
++			}
++		}
++		if region == "" {
++			return ctx, fmt.Errorf("--region is required for bedrock provider (or set AWS_REGION)")
++		}
++		opt, err := safeBedrockAuth(region)
++		if err != nil {
++			return ctx, err
++		}
++		providerOptions = []option.RequestOption{opt}
++		return ctx, nil
++
++	default:
++		return ctx, fmt.Errorf("unsupported provider: %s (must be anthropic, vertex, or bedrock)", provider)
++	}
++}
++
++// safeBedrockAuth wraps bedrock.WithLoadDefaultConfig with panic recovery.
++func safeBedrockAuth(region string) (opt option.RequestOption, err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("bedrock auth failed: %v", r)
++		}
++	}()
++	ctx := context.Background()
++	opt = bedrock.WithLoadDefaultConfig(ctx, config.WithRegion(region))
++	return
++}
++
+ func getDefaultRequestOptions(cmd *cli.Command) []option.RequestOption {
+ 	opts := []option.RequestOption{
+ 		option.WithHeader("User-Agent", fmt.Sprintf("Anthropic/CLI %s", Version)),
+@@ -37,6 +106,18 @@ func getDefaultRequestOptions(cmd *cli.Command) []option.RequestOption {
+ 		option.WithHeader("X-Stainless-Runtime", "cli"),
+ 		option.WithHeader("X-Stainless-CLI-Command", cmd.FullName()),
+ 	}
++
++	// Warn about flags that are ignored with non-Anthropic providers
++	provider := cmd.String("provider")
++	if provider != "" && provider != "anthropic" {
++		if cmd.IsSet("api-key") {
++			fmt.Fprintf(os.Stderr, "Warning: --api-key is ignored when using %s provider\n", provider)
++		}
++		if cmd.IsSet("base-url") {
++			fmt.Fprintf(os.Stderr, "Warning: --base-url is ignored when using %s provider\n", provider)
++		}
++	}
++
+ 	if cmd.IsSet("api-key") {
+ 		opts = append(opts, option.WithAPIKey(cmd.String("api-key")))
+ 	}
+@@ -49,6 +130,9 @@ func getDefaultRequestOptions(cmd *cli.Command) []option.RequestOption {
+ 		opts = append(opts, option.WithBaseURL(baseURL))
+ 	}
+ 
++	// Append provider-specific options (set during Before hook)
++	opts = append(opts, providerOptions...)
++
+ 	return opts
+ }
+ 
